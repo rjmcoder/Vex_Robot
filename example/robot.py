@@ -138,6 +138,88 @@ def get_XYZ(depth_image):
     ), axis=-1)
     return XYZ
 
+def update_robot_goto(robot, state, goal):
+    dpos = np.array(goal) - state[:2]
+    dist = np.sqrt(dpos[0] ** 2 + dpos[1] ** 2)
+    theta = np.degrees(np.arctan2(dpos[1], dpos[0])) - state[2]
+    theta = (theta + 180) % 360 - 180 # [-180, 180]
+    Pforward = 30
+    Ptheta = 8
+
+    # restrict operating range
+    if np.abs(theta) < 30:
+        #   # P-controller
+        robot.motor[0] = -Pforward * dist + Ptheta * theta
+        robot.motor[9] =  Pforward * dist + Ptheta * theta
+    else:
+        robot.motor[0] = 127 if theta > 0 else -127
+        robot.motor[9] = 127 if theta > 0 else -127
+
+def update_robot_move_arm(robot, angle, goal):
+    # P-controller with constant current
+    robot.motor[1] = (goal - angle) * 127 + 30
+
+def find_path(objmap, state, goaltag):
+  visited = np.zeros(objmap.shape, np.uint8)
+  frontier = [(int(state[0]) + 72, int(state[1]) + 72)]
+  parent = {}
+
+  while frontier:
+    curr = frontier.pop(0)
+    visited[curr[0], curr[1]] = True
+    if objmap[curr[0], curr[1]] == goaltag:
+      path = [curr]
+      while curr in parent:
+        path.insert(0, parent[curr])
+        curr = parent[curr]
+      for i in range(len(path)):
+        path[i] = (path[i][0] - 72, path[i][1] - 72)
+      return path
+    neighbors = [
+      (curr[0] - 1, curr[1] + 0),
+      (curr[0] + 1, curr[1] + 0),
+      (curr[0] + 0, curr[1] - 1),
+      (curr[0] + 0, curr[1] + 1)
+    ]
+    for neighbor in neighbors:
+      if 0 <= neighbor[0] < 144 and \
+         0 <= neighbor[1] < 144 and \
+         not visited[neighbor[0], neighbor[1]]:
+        frontier.append(neighbor)
+        visited[neighbor[0], neighbor[1]] = True
+        parent[neighbor] = curr
+
+  return None
+
+def draw_boxes(boxes, classes, labels, image):
+    """
+    Draws the bounding box around a detected object.
+    """
+    lw = max(round(sum(image.shape) / 2 * 0.003), 2)  # Line width.
+    tf = max(lw - 1, 1) # Font thickness.
+    for i, box in enumerate(boxes):
+        # color = COLORS[labels[i]]
+        cv2.rectangle(
+            img=image,
+            pt1=(int(box[0]), int(box[1])),
+            pt2=(int(box[2]), int(box[3])),
+            color=(0,0,255), #color[::-1],
+            thickness=lw
+        )
+        cv2.putText(
+            img=image,
+            text="ball",
+            org=(int(box[0]), int(box[1]-5)),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=lw / 3,
+            color=(0,0,255), #color[::-1],
+            thickness=tf,
+            lineType=cv2.LINE_AA
+        )
+    return image
+
+
+
 if __name__ == "__main__":
     robot = RemoteInterface("192.168.1.156") # home
     # robot = RemoteInterface("192.168.50.194") # clbairobotics
@@ -186,7 +268,9 @@ if __name__ == "__main__":
 
         robot.update() # must never be forgotten
         color, depth, sensors = robot.read()
-        
+
+        # =========== object detection ====================================================================
+
         preprocess = transforms.Compose([ transforms.ToTensor(), ])
         input_tensor = preprocess(Image.fromarray(color))
         input_batch = input_tensor.unsqueeze(0).to('cuda')
@@ -202,7 +286,13 @@ if __name__ == "__main__":
         masks  = output["masks"] [indeces_found] # mask in the image (N, 1, height, width)
         boxes  = output["boxes"] [indeces_found] # bounding boxes, not really needed
 
+        boxes = boxes[scores >= 0.5] #.astype(np.int32)
+        masks = masks[scores >= 0.5] #.astype(np.int32)
+
         print(f"\nbox around ball(s) location(s): {boxes}\n")
+        # print(f"\nmask around ball(s) location(s): {masks}\n")
+
+        color = draw_boxes(boxes, ["sports ball"], labels, color)
 
         # get a single mask's centered XYZ coordinates, ball's location
         single_mask = np.zeros((360, 640), dtype=np.uint8)
@@ -211,7 +301,7 @@ if __name__ == "__main__":
         ball_depth = depth * (single_mask > 0)
         xyz = get_XYZ(ball_depth)
 
-        print(f"\nxyz of the ball: {xyz}\n")
+        # print(f"\nxyz of the ball: {xyz}\n")
 
         num_pixels = np.sum(ball_depth > 0)
         if num_pixels > 0:
@@ -220,10 +310,12 @@ if __name__ == "__main__":
         if num_pixels > 0:
             print(f"\ncenter of the ball location: {average_xyz}\n")
 
+        cv2.circle(color, (int(average_xyz[0]), int(average_xyz[1])), 8, (0, 0, 255), -1)
+
         cv2.imshow("color", color)
         cv2.waitKey(1)
 
-        # =========== slam ===========================
+        # =========== slam ====================================================================
 
         # filter the depth image so that noise is removed
         depth = depth.astype(np.float32) / 1000.
@@ -235,8 +327,7 @@ if __name__ == "__main__":
         o3d_depth = open3d.geometry.Image(filtered_depth)
         o3d_rgbd  = open3d.geometry.RGBDImage.create_from_color_and_depth(o3d_color, o3d_depth)
 
-        tags = at_detector.detect(
-        cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), True, camera_params, 2.5)
+        tags = at_detector.detect(cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), True, camera_params, 2.5)
         found_tag = False
         for tag in tags:
             if tag.decision_margin < 50: continue
@@ -245,7 +336,7 @@ if __name__ == "__main__":
                 print(tag.pose_R, tag.pose_t)
                 # global_T = get_pose(tag.pose_R, tag.pose_t) # use your get_pose algorithm here!
                 found_tag = True
-        
+
         if not found_tag and prev_rgbd_image is not None: # use RGBD odometry relative transform to estimate pose
             T = np.identity(4)
             ret, T, _ = open3d.pipelines.odometry.compute_rgbd_odometry(
@@ -263,7 +354,15 @@ if __name__ == "__main__":
         cv2.waitKey(1)
 
 
+        # ==================== path planning ==============================
+        # x, y, theta = RGBDOdometry()
+        sensors = robot.read()
+        x, y = robot.pos
+        theta = robot.angle  # get these from SLAM
 
+        path = find_path(objective_map, (x, y, theta), 1)
+        goal = path[min(5, len(path) - 1)]  # get 5 steps ahead
+        update_robot_goto(robot, (x, y, theta), goal)
 
 
 
@@ -343,7 +442,7 @@ if __name__ == "__main__":
 
         #break
 
-    robot.__del__()
+    # robot.__del__()
 
 
 
