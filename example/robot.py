@@ -12,6 +12,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from pyapriltags import Detector
 import open3d
+import random
 
 def bringArmToHighPosition():
 
@@ -218,13 +219,37 @@ def draw_boxes(boxes, classes, labels, image):
         )
     return image
 
+def wheelsMoveForward(x):
+    robot.motor[0] = -x  # left wheel
+    robot.motor[9] = x  # right wheel
 
+def wheelsMoveBackward(x):
+    robot.motor[0] = x  # left wheel
+    robot.motor[9] = -x  # right wheel
+
+def wheelsTurnLeft(x):
+    robot.motor[0] = 0
+    robot.motor[9] = x
+
+def wheelsTurnSharpLeft(x):
+    robot.motor[0] = x
+    robot.motor[9] = x
+
+def wheelsTurnRight(x):
+    robot.motor[0] = -x
+    robot.motor[9] = 0
+
+def wheelsTurnSharpRight(x):
+    robot.motor[0] = -x
+    robot.motor[9] = -x
 
 if __name__ == "__main__":
     robot = RemoteInterface("192.168.1.156") # home
     # robot = RemoteInterface("192.168.50.194") # clbairobotics
 
     _iter = 0
+
+    centerOfClawInImage = (320, 186)
 
     armHeightAtLowPosition = 483
     armHeightAtHighPosition = 1487
@@ -285,84 +310,140 @@ if __name__ == "__main__":
         labels = output["labels"][indeces_found] # integer id of the object found, refer to COCO classes
         masks  = output["masks"] [indeces_found] # mask in the image (N, 1, height, width)
         boxes  = output["boxes"] [indeces_found] # bounding boxes, not really needed
-
         boxes = boxes[scores >= 0.5] #.astype(np.int32)
         masks = masks[scores >= 0.5] #.astype(np.int32)
+
+        boxes = np.sort(boxes, axis = 0)
 
         print(f"\nbox around ball(s) location(s): {boxes}\n")
         # print(f"\nmask around ball(s) location(s): {masks}\n")
 
         color = draw_boxes(boxes, ["sports ball"], labels, color)
 
-        # get a single mask's centered XYZ coordinates, ball's location
-        single_mask = np.zeros((360, 640), dtype=np.uint8)
-        if len(masks) > 0:
-            single_mask = masks[0].reshape((360, 640))
-        ball_depth = depth * (single_mask > 0)
-        xyz = get_XYZ(ball_depth)
+        if len(boxes) != 0:
+            print("found ball(s)")
+            firstBall = boxes[0]
+            x1, y1, x2, y2 = firstBall
+            centerOfBall = (int((x1+x2)/2), int((y1+y2)/2))
+            cx, cy = centerOfBall
+            cv2.circle(color, (int(centerOfBall[0]), int(centerOfBall[1])), 2, (0, 0, 255), -1)
+            print(f"\ncenter of the ball location: {centerOfBall}\n")
+            cv2.imshow("color", color)
+            cv2.waitKey(1)
+
+            # check if ball is within the width of the claw
+            if centerOfClawInImage[0] * 0.95 < cx < centerOfClawInImage[0] * 1.05:
+                print("ball within claws width")
+                if cy > 250:
+                    print("reached close to the ball")
+                    # while True:
+                    #     if limitSwitchPressed == True:
+                    #         wheelsMoveForward(0)
+                    # for i in range(5):
+                    #     wheelsMoveForward(10)
+                    wheelsMoveForward(0)
+                else:
+                    wheelsMoveForward(50)
+            else:
+                print("turning to align towards the ball")
+                # ball is towards the right
+                if cx > centerOfClawInImage[0] * 1.05:
+                    wheelsTurnRight(50)
+                    continue
+                # ball is towards the left
+                if cx < centerOfClawInImage[0] * 0.95:
+                    wheelsTurnLeft(50)
+                    continue
+        else:
+            # move the wheels and look at some other location for a ball
+            print("looking for a ball")
+            randomChoice = random.choice([1,2,3,4])
+            power = 50
+            steps = 20
+            if randomChoice == 1:
+                for i in range(steps):
+                    wheelsMoveForward(power)
+            if randomChoice == 2:
+                for i in range(steps):
+                    wheelsMoveBackward(power)
+            if randomChoice == 3:
+                for i in range(steps*5):
+                    wheelsTurnSharpRight(power)
+            if randomChoice == 4:
+                for i in range(steps*5):
+                    wheelsTurnSharpLeft(power)
+            continue
+
+        # # get a single mask's centered XYZ coordinates, ball's location
+        # single_mask = np.zeros((360, 640), dtype=np.uint8)
+        # if len(masks) > 0:
+        #     single_mask = masks[0].reshape((360, 640))
+        # ball_depth = depth * (single_mask > 0)
+        # xyz = get_XYZ(ball_depth)
 
         # print(f"\nxyz of the ball: {xyz}\n")
 
-        num_pixels = np.sum(ball_depth > 0)
-        if num_pixels > 0:
-            average_xyz = np.sum(xyz, axis=0) / num_pixels
+        # num_pixels = np.sum(ball_depth > 0)
+        # if num_pixels > 0:
+        #     average_xyz = np.sum(xyz, axis=0) / num_pixels
+        #     print(f"\ncenter of the ball location: {average_xyz}\n")
 
-        if num_pixels > 0:
-            print(f"\ncenter of the ball location: {average_xyz}\n")
-
-        cv2.circle(color, (int(average_xyz[0]), int(average_xyz[1])), 8, (0, 0, 255), -1)
 
         cv2.imshow("color", color)
         cv2.waitKey(1)
+        pass
 
-        # =========== slam ====================================================================
-
-        # filter the depth image so that noise is removed
-        depth = depth.astype(np.float32) / 1000.
-        mask = np.bitwise_and(depth > 0.1, depth < 3.0) # -> valid depth points
-        filtered_depth = np.where(mask, depth, 0)
-
-        # converting to Open3D's format so we can do odometry
-        o3d_color = open3d.geometry.Image(color)
-        o3d_depth = open3d.geometry.Image(filtered_depth)
-        o3d_rgbd  = open3d.geometry.RGBDImage.create_from_color_and_depth(o3d_color, o3d_depth)
-
-        tags = at_detector.detect(cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), True, camera_params, 2.5)
-        found_tag = False
-        for tag in tags:
-            if tag.decision_margin < 50: continue
-            #found_tag!
-            if tag.tag_id == 1: # 1..8
-                print(tag.pose_R, tag.pose_t)
-                # global_T = get_pose(tag.pose_R, tag.pose_t) # use your get_pose algorithm here!
-                found_tag = True
-
-        if not found_tag and prev_rgbd_image is not None: # use RGBD odometry relative transform to estimate pose
-            T = np.identity(4)
-            ret, T, _ = open3d.pipelines.odometry.compute_rgbd_odometry(
-                o3d_rgbd, prev_rgbd_image, cam_intrinsic_params, T,
-                open3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(), option)
-            global_T = global_T.dot(T)
-            rotation = global_T[:3,:3]
-            print(f"\nRotation: {R.from_matrix(rotation).as_rotvec(degrees=True)}")
-
-        prev_rgbd_image = o3d_rgbd # we forgot this last time!
-
-        # dont need this, but helpful to visualize
-        filtered_color = np.where(np.tile(mask.reshape(360, 640, 1), (1, 1, 3)), color, 0)
-        cv2.imshow("color", filtered_color)
-        cv2.waitKey(1)
-
-
-        # ==================== path planning ==============================
-        # x, y, theta = RGBDOdometry()
-        sensors = robot.read()
-        x, y = robot.pos
-        theta = robot.angle  # get these from SLAM
-
-        path = find_path(objective_map, (x, y, theta), 1)
-        goal = path[min(5, len(path) - 1)]  # get 5 steps ahead
-        update_robot_goto(robot, (x, y, theta), goal)
+        # # =========== slam ====================================================================
+        #
+        # # filter the depth image so that noise is removed
+        # depth = depth.astype(np.float32) / 1000.
+        # mask = np.bitwise_and(depth > 0.1, depth < 3.0) # -> valid depth points
+        # filtered_depth = np.where(mask, depth, 0)
+        #
+        # cv2.imshow("filtered_depth", filtered_depth)
+        # cv2.waitKey(1)
+        #
+        # # converting to Open3D's format so we can do odometry
+        # o3d_color = open3d.geometry.Image(color)
+        # o3d_depth = open3d.geometry.Image(filtered_depth)
+        # o3d_rgbd  = open3d.geometry.RGBDImage.create_from_color_and_depth(o3d_color, o3d_depth)
+        #
+        # tags = at_detector.detect(cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), True, camera_params, 2.5)
+        # found_tag = False
+        # for tag in tags:
+        #     if tag.decision_margin < 50: continue
+        #     #found_tag!
+        #     if tag.tag_id == 1: # 1..8
+        #         print(tag.pose_R, tag.pose_t)
+        #         # global_T = get_pose(tag.pose_R, tag.pose_t) # use your get_pose algorithm here!
+        #         found_tag = True
+        #
+        # if not found_tag and prev_rgbd_image is not None: # use RGBD odometry relative transform to estimate pose
+        #     T = np.identity(4)
+        #     ret, T, _ = open3d.pipelines.odometry.compute_rgbd_odometry(
+        #         o3d_rgbd, prev_rgbd_image, cam_intrinsic_params, T,
+        #         open3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(), option)
+        #     global_T = global_T.dot(T)
+        #     rotation = global_T[:3,:3]
+        #     print(f"\nRotation: {R.from_matrix(rotation).as_rotvec(degrees=True)}")
+        #
+        # prev_rgbd_image = o3d_rgbd # we forgot this last time!
+        #
+        # # dont need this, but helpful to visualize
+        # filtered_color = np.where(np.tile(mask.reshape(360, 640, 1), (1, 1, 3)), color, 0)
+        # cv2.imshow("color", filtered_color)
+        # cv2.waitKey(1)
+        #
+        #
+        # # ==================== path planning ==============================
+        # # x, y, theta = RGBDOdometry()
+        # sensors = robot.read()
+        # x, y = robot.pos
+        # theta = robot.angle  # get these from SLAM
+        #
+        # path = find_path(objective_map, (x, y, theta), 1)
+        # goal = path[min(5, len(path) - 1)]  # get 5 steps ahead
+        # update_robot_goto(robot, (x, y, theta), goal)
 
 
 
